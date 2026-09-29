@@ -46,6 +46,11 @@ inputs:
     required: false
     type: boolean
     default: true
+  ksu_susfs_ref:
+    description: 'Branch/commit of pershoot/KernelSU-Next used when enable_susfs is true (ksu_branch_or_hash is ignored in that case, since it is validated against the KernelSU-Next org)'
+    required: false
+    type: string
+    default: 'dev-susfs'
   susfs_ref:
     description: 'susfs4ksu tag/commit to pin (empty = head of the gki-<android>-<kernel> branch, e.g. gki-android16-6.12). A commit is only valid on its own GKI branch.'
     required: false
@@ -807,7 +812,13 @@ runs:
           KSU_OWNER="KernelSU-Next"
           FALLBACK_REF="dev"
         fi
-        SETUP_REF="${KSU_INPUT:-$FALLBACK_REF}"
+        if [ "$SUSFS_ON" = "true" ]; then
+          SETUP_REF="${{ inputs.ksu_susfs_ref }}"
+          SETUP_REF="${SETUP_REF:-$FALLBACK_REF}"
+          echo "SUSFS on: ignoring ksu_branch_or_hash='${KSU_INPUT}', using pershoot/KernelSU-Next@${SETUP_REF}"
+        else
+          SETUP_REF="${KSU_INPUT:-$FALLBACK_REF}"
+        fi
 
         echo "Downloading KernelSU Next setup script from ${KSU_OWNER}@${SETUP_REF}..."
         if ! curl --fail --location --proto '=https' --tlsv1.2 -LSs \
