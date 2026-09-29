@@ -41,6 +41,16 @@ inputs:
     required: false
     type: boolean
     default: false
+  enable_susfs:
+    description: 'Build SUSFS into the kernel (built-in, NOT a module). Uses simonpunk/susfs4ksu kernel patch + pershoot/KernelSU-Next (dev-susfs)'
+    required: false
+    type: boolean
+    default: true
+  susfs_ref:
+    description: 'susfs4ksu tag/commit to pin (empty = head of the gki-<android>-<kernel> branch, e.g. gki-android16-6.12). A commit is only valid on its own GKI branch.'
+    required: false
+    type: string
+    default: ''
   nomount_ref:
     description: 'NoMount-Suite branch/ref to source the Prism engine src + patches from (default main; set a branch to validate it before it is released). The engine ships inside the Suite repo, under hookless/.'
     required: false
@@ -788,17 +798,27 @@ runs:
         trap 'rm -f "$KSUN_SETUP_SCRIPT"' EXIT
 
         KSU_INPUT="${{ inputs.ksu_branch_or_hash }}"
-        SETUP_REF="${KSU_INPUT:-dev}"
+        SUSFS_ON="${{ inputs.enable_susfs }}"
+        if [ "$SUSFS_ON" = "true" ]; then
+          # SUSFS-integrated KernelSU-Next (the official KernelSU-Next/dev has no SUSFS glue)
+          KSU_OWNER="pershoot"
+          FALLBACK_REF="dev-susfs"
+        else
+          KSU_OWNER="KernelSU-Next"
+          FALLBACK_REF="dev"
+        fi
+        SETUP_REF="${KSU_INPUT:-$FALLBACK_REF}"
 
-        echo "Downloading KernelSU Next setup script from $SETUP_REF..."
+        echo "Downloading KernelSU Next setup script from ${KSU_OWNER}@${SETUP_REF}..."
         if ! curl --fail --location --proto '=https' --tlsv1.2 -LSs \
           --retry 5 --retry-delay 5 --retry-all-errors \
-          "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/${SETUP_REF}/kernel/setup.sh" \
+          "https://raw.githubusercontent.com/${KSU_OWNER}/KernelSU-Next/${SETUP_REF}/kernel/setup.sh" \
           -o "$KSUN_SETUP_SCRIPT"; then
-          echo "::warning::setup.sh not available at $SETUP_REF, falling back to dev"
+          echo "::warning::setup.sh not available at $SETUP_REF, falling back to $FALLBACK_REF"
+          SETUP_REF="$FALLBACK_REF"
           if ! curl --fail --location --proto '=https' --tlsv1.2 -LSs \
             --retry 5 --retry-delay 5 --retry-all-errors \
-            "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/dev/kernel/setup.sh" \
+            "https://raw.githubusercontent.com/${KSU_OWNER}/KernelSU-Next/${FALLBACK_REF}/kernel/setup.sh" \
             -o "$KSUN_SETUP_SCRIPT"; then
             echo "::error::Failed to download KernelSU Next setup.sh after retries"
             exit 1
@@ -818,11 +838,34 @@ runs:
 
         chmod +x "$KSUN_SETUP_SCRIPT"
 
-        if [ -z "$KSU_INPUT" ]; then
+        if [ "$SUSFS_ON" = "true" ]; then
+          bash "$KSUN_SETUP_SCRIPT" "$SETUP_REF"
+        elif [ -z "$KSU_INPUT" ]; then
           bash "$KSUN_SETUP_SCRIPT"
         else
           bash "$KSUN_SETUP_SCRIPT" "$KSU_INPUT"
         fi
+
+        if [ "$SUSFS_ON" = "true" ]; then
+          # setup.sh may clone from the KernelSU-Next org; make sure the tree is really pershoot's SUSFS branch
+          pushd KernelSU-Next >/dev/null
+          if ! git remote get-url origin | grep -qi 'pershoot/KernelSU-Next'; then
+            echo "Re-pointing KernelSU-Next to pershoot/KernelSU-Next@$SETUP_REF"
+            git remote set-url origin https://github.com/pershoot/KernelSU-Next.git
+            if [ "$(git rev-parse --is-shallow-repository)" = "true" ]; then
+              git fetch --unshallow origin || true
+            fi
+            git fetch origin "$SETUP_REF"
+            git checkout -f -B susfs-build FETCH_HEAD
+          fi
+          if ! grep -rqi 'susfs' kernel/Kconfig kernel/Kbuild 2>/dev/null; then
+            echo "::error::KernelSU-Next checkout ($SETUP_REF) has no SUSFS integration in kernel/Kconfig|Kbuild"
+            exit 1
+          fi
+          echo "✅ SUSFS-integrated KernelSU-Next: $(git rev-parse --short HEAD)"
+          popd >/dev/null
+        fi
+
         git submodule update --init --recursive
         cd KernelSU-Next/kernel
 
@@ -894,6 +937,88 @@ runs:
       shell: bash
       run: |
         bash "$BOUTEILLE_KERNEL_PATCHES_FOLDER/scripts/fix_ksu_cfi_symbol_calls.sh"
+
+    - name: Add SUSFS (built-in kernel patch)
+      if: ${{ inputs.enable_susfs == true || inputs.enable_susfs == 'true' }}
+      shell: bash
+      run: |
+        set -euo pipefail
+        echo "::group::Add SUSFS (built-in)"
+
+        SUSFS_BRANCH="gki-${ANDROID_VER}-${KERNEL_VER}"
+        SUSFS_DIR="$GITHUB_WORKSPACE/susfs4ksu"
+        SUSFS_PIN="${{ inputs.susfs_ref }}"
+        rm -rf "$SUSFS_DIR"
+
+        cloned=false
+        for url in "https://gitlab.com/simonpunk/susfs4ksu.git" "https://github.com/ShirkNeko/susfs4ksu.git"; do
+          for attempt in 1 2 3; do
+            echo "🔄 Cloning $url ($SUSFS_BRANCH) attempt $attempt/3"
+            if git clone --single-branch --branch "$SUSFS_BRANCH" "$url" "$SUSFS_DIR"; then
+              cloned=true
+              break 2
+            fi
+            rm -rf "$SUSFS_DIR"
+            sleep $((attempt * 5))
+          done
+        done
+        if [ "$cloned" != true ]; then
+          echo "::error::Could not clone susfs4ksu branch $SUSFS_BRANCH (does this GKI version have a SUSFS branch?)"
+          exit 1
+        fi
+
+        if [ -n "$SUSFS_PIN" ]; then
+          git -C "$SUSFS_DIR" checkout "$SUSFS_PIN"
+        fi
+        SUSFS_COMMIT="$(git -C "$SUSFS_DIR" rev-parse --short HEAD)"
+        echo "SUSFS_COMMIT=$SUSFS_COMMIT" >> "$GITHUB_ENV"
+        echo "susfs4ksu: $SUSFS_BRANCH @ $SUSFS_COMMIT"
+
+        PATCH="$SUSFS_DIR/kernel_patches/50_add_susfs_in_${SUSFS_BRANCH}.patch"
+        if [ ! -f "$PATCH" ]; then
+          echo "::error::SUSFS patch not found: $PATCH"
+          ls -la "$SUSFS_DIR/kernel_patches" || true
+          exit 1
+        fi
+
+        cd "$COMMON_KERNEL_FOLDER"
+
+        # new source files shipped next to the patch (fs/susfs.c, include/linux/susfs*.h, ...)
+        if [ -d "$SUSFS_DIR/kernel_patches/fs" ]; then
+          cp -rv "$SUSFS_DIR/kernel_patches/fs/." fs/
+        fi
+        if [ -d "$SUSFS_DIR/kernel_patches/include/linux" ]; then
+          cp -rv "$SUSFS_DIR/kernel_patches/include/linux/." include/linux/
+        fi
+
+        echo "Applying $(basename "$PATCH")"
+        if ! patch -p1 --forward -F 3 < "$PATCH" 2>&1 | tee /tmp/susfs_patch.log; then
+          echo "::warning::SUSFS patch reported failed hunks"
+        fi
+        if find . -name '*.rej' -print -quit | grep -q .; then
+          echo "::error::SUSFS patch has rejected hunks (kernel tree differs from the GKI base the patch was written for):"
+          find . -name '*.rej' -exec echo "=== {} ===" \; -exec cat {} \;
+          exit 1
+        fi
+
+        cat >> "$COMMON_KERNEL_FOLDER/arch/arm64/configs/gki_defconfig" <<EOF
+        CONFIG_KSU_SUSFS=y
+        CONFIG_KSU_SUSFS_SUS_PATH=y
+        CONFIG_KSU_SUSFS_SUS_MOUNT=y
+        CONFIG_KSU_SUSFS_SUS_KSTAT=y
+        CONFIG_KSU_SUSFS_SPOOF_UNAME=y
+        CONFIG_KSU_SUSFS_ENABLE_LOG=y
+        CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y
+        CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG=y
+        CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
+        CONFIG_KSU_SUSFS_SUS_MAP=y
+        EOF
+
+        SUSFS_VERSION="$(grep -rhoE '#define[[:space:]]+SUSFS_VERSION[[:space:]]+"[^"]+"' include/linux/susfs*.h 2>/dev/null | head -n1 | sed -E 's/.*"([^"]+)".*/\1/' || true)"
+        echo "SUSFS_VERSION=${SUSFS_VERSION:-unknown}" >> "$GITHUB_ENV"
+
+        echo "✅ SUSFS ${SUSFS_VERSION:-?} ($SUSFS_BRANCH @ $SUSFS_COMMIT) patched into kernel"
+        echo "::endgroup::"
 
     - name: Apply NoMount (hookless) Patch
       if: ${{ env.OP_NMS == 'true' }}
@@ -1671,10 +1796,18 @@ runs:
 
         make LD="$COMMON_KERNEL_FOLDER/ld-wrapper" HOSTLD="$COMMON_KERNEL_FOLDER/ld-wrapper" O="$OUT" olddefconfig
 
-        for sym in CONFIG_KSU; do
+        REQUIRED_SYMS=(CONFIG_KSU)
+        if [ "${{ inputs.enable_susfs }}" = "true" ]; then
+          REQUIRED_SYMS+=(CONFIG_KSU_SUSFS)
+        fi
+        for sym in "${REQUIRED_SYMS[@]}"; do
           grep -q "^${sym}=y" "$OUT/.config" \
             || { echo "::error::${sym} was dropped by olddefconfig (not defined by the KSU source?)"; exit 1; }
         done
+        if [ "${{ inputs.enable_susfs }}" = "true" ]; then
+          echo "SUSFS options in final .config:"
+          grep '^CONFIG_KSU_SUSFS' "$OUT/.config" || true
+        fi
         
         KCFLAGS="$KCFLAGS -Wno-error -pipe ${KCFLAGS_EXTRA}"
         KCPPFLAGS="$KCPPFLAGS -DCONFIG_OPTIMIZE_INLINING"
@@ -1958,6 +2091,9 @@ runs:
           if [ "${{ env.OP_NMS }}" = true ]; then
             echo "NoMount Version: ${NMVER:-unknown}"
           fi
+          if [ "${{ inputs.enable_susfs }}" = "true" ]; then
+            echo "SUSFS: ${SUSFS_VERSION:-unknown} (${SUSFS_COMMIT:-unknown}) built-in"
+          fi
           echo "Optimization: ${{ inputs.optimize_level }}"
           echo "Clean Build: ${{ inputs.clean }}"
           echo ""
@@ -2010,6 +2146,9 @@ runs:
           echo "| **Build User** | ${{ env.BUILD_USER }} |"
           echo "| **Build Host** | ${{ env.BUILD_HOST }} |"
           echo "| **KernelSU Next Version** | ${KSUVER:-unknown} |"
+          if [ "${{ inputs.enable_susfs }}" = "true" ]; then
+            echo "| **SUSFS (built-in)** | ${SUSFS_VERSION:-unknown} (\`${SUSFS_COMMIT:-unknown}\`) |"
+          fi
           
           if [ "$KSU_SHA" != "unknown" ]; then
             echo "| **KernelSU Next Commit** | [\`${KSU_SHA:0:8}\`](https://github.com/KernelSU-Next/KernelSU-Next/commit/$KSU_SHA) |"
