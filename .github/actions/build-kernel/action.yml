@@ -906,9 +906,22 @@ runs:
             echo "::error::ALT_SIZE ${ALT_SIZE} exceeds the kernel CERT_MAX_LENGTH of 1024; use an RSA 2048 signing key"
             exit 1
           fi
-          sed -i "s|return check_v2_signature(path, EXPECTED_MANAGER_SIZE, EXPECTED_MANAGER_HASH);|return check_v2_signature(path, EXPECTED_MANAGER_SIZE, EXPECTED_MANAGER_HASH) \|\| check_v2_signature(path, ${ALT_SIZE}, \"${ALT_HASH}\");|" manager/apk_sign.c
-          if ! grep -q "${ALT_HASH}" manager/apk_sign.c; then
-            echo "::error::Failed to patch manager/apk_sign.c for the secondary manager key"
+          if grep -q "check_v2_signature(path, EXPECTED_MANAGER_SIZE, EXPECTED_MANAGER_HASH)" manager/apk_sign.c; then
+            # older KSUN layout: single hardcoded expected size/hash
+            sed -i "s|return check_v2_signature(path, EXPECTED_MANAGER_SIZE, EXPECTED_MANAGER_HASH);|return check_v2_signature(path, EXPECTED_MANAGER_SIZE, EXPECTED_MANAGER_HASH) \|\| check_v2_signature(path, ${ALT_SIZE}, \"${ALT_HASH}\");|" manager/apk_sign.c
+            if ! grep -q "${ALT_HASH}" manager/apk_sign.c; then
+              echo "::error::Failed to patch manager/apk_sign.c for the secondary manager key"
+              exit 1
+            fi
+          elif grep -q "^KSU_NEXT_MANAGER_LIST[[:space:]]*:=" Kbuild; then
+            # newer KSUN layout (pershoot dev-susfs): comma-separated "size:sha256" list in Kbuild
+            sed -i "s|^\(KSU_NEXT_MANAGER_LIST[[:space:]]*:=[[:space:]]*[^[:space:]]*\)|\1,${ALT_SIZE}:${ALT_HASH}|" Kbuild
+            if ! grep -q "${ALT_HASH}" Kbuild; then
+              echo "::error::Failed to add the secondary manager key to KSU_NEXT_MANAGER_LIST in Kbuild"
+              exit 1
+            fi
+          else
+            echo "::error::Unknown manager signature layout (neither apk_sign.c check nor Kbuild KSU_NEXT_MANAGER_LIST found)"
             exit 1
           fi
           echo "-- Secondary manager key trusted: ${ALT_SIZE} / ${ALT_HASH}"
