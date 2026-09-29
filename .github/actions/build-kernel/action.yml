@@ -1058,8 +1058,12 @@ runs:
       run: |
         bash "$BOUTEILLE_KERNEL_PATCHES_FOLDER/scripts/apply_nomount_stack.sh" record-version
         bash "$BOUTEILLE_KERNEL_PATCHES_FOLDER/scripts/apply_nomount_stack.sh" hook
-        bash "$BOUTEILLE_KERNEL_PATCHES_FOLDER/scripts/apply_nomount_stack.sh" ghost
 
+        if [ "${{ inputs.enable_susfs }}" = "true" ]; then
+          echo "::warning::Skipping NoMount _ghost family: conflicts with SUSFS sus_path/sus_kstat/open_redirect"
+        else
+          bash "$BOUTEILLE_KERNEL_PATCHES_FOLDER/scripts/apply_nomount_stack.sh" ghost
+        fi
     - name: Add BBG
       if: ${{ env.OP_BBG == 'true' }}
       shell: bash
